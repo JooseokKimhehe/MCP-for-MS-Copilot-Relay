@@ -122,16 +122,23 @@ def _get_gateway_api_key() -> str:
 
 async def _require_gateway_auth(authorization: Optional[str] = Header(None)) -> None:
     expected = _get_gateway_api_key()
+    logger.info("[MCP] Auth check: expected_key_len=%d", len(expected))
     if not expected:
-        logger.warning("[MCP] MCP_API_KEY not set; denying request")
+        logger.error("[MCP] MCP_API_KEY not configured")
         raise HTTPException(status_code=500, detail={"error": "server_misconfigured"})
     if not authorization:
+        logger.warning("[MCP] Auth failed: missing Authorization header")
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
     scheme, _, token = authorization.partition(" ")
+    logger.info("[MCP] Auth header received: scheme=%s, token_len=%d", scheme, len(token) if token else 0)
     if scheme.lower() != "bearer" or not token:
+        logger.warning("[MCP] Auth failed: invalid Authorization header format (expected 'Bearer <token>')")
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
-    if not secrets.compare_digest(token.strip(), expected):
+    token = token.strip()
+    if not secrets.compare_digest(token, expected):
+        logger.warning("[MCP] Auth failed: token mismatch (received_len=%d, expected_len=%d, received=%s)", len(token), len(expected), token)
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+    logger.info("[MCP] Auth success")
 
 
 def _split_tool_name(tool_name: str) -> Optional[tuple[str, str]]:
