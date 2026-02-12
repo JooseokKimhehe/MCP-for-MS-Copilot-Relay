@@ -115,16 +115,45 @@ def _load_submcp_configs() -> list[SubMCPConfig]:
     return []
 
 
-def _get_gateway_api_key() -> str:
+def _parse_gateway_keys(raw: str) -> dict[str, str]:
+    keys: dict[str, str] = {}
+    if not raw:
+        return keys
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            label, _, value = entry.partition(":")
+        elif "=" in entry:
+            label, _, value = entry.partition("=")
+        else:
+            continue
+        label = label.strip()
+        value = value.strip()
+        if not label or not value:
+            continue
+        keys[label] = value
+    return keys
+
+
+def _get_gateway_api_keys() -> dict[str, str]:
     _load_env_file(_SUBMCP_ENV_PATH)
-    return os.getenv("MCP_API_KEY", "").strip()
+    raw_keys = os.getenv("MCP_API_KEYS", "").strip()
+    parsed = _parse_gateway_keys(raw_keys)
+    if parsed:
+        return parsed
+    single = os.getenv("MCP_API_KEY", "").strip()
+    if single:
+        return {"default": single}
+    return {}
 
 
 async def _require_gateway_auth(authorization: Optional[str] = Header(None)) -> None:
-    expected = _get_gateway_api_key()
-    logger.info("[MCP] Auth check: expected_key_len=%d", len(expected))
-    if not expected:
-        logger.error("[MCP] MCP_API_KEY not configured")
+    expected_keys = _get_gateway_api_keys()
+    logger.info("[MCP] Auth check: expected_key_count=%d", len(expected_keys))
+    if not expected_keys:
+        logger.error("[MCP] MCP_API_KEY(S) not configured")
         raise HTTPException(status_code=500, detail={"error": "server_misconfigured"})
     if not authorization:
         logger.warning("[MCP] Auth failed: missing Authorization header")
@@ -135,8 +164,9 @@ async def _require_gateway_auth(authorization: Optional[str] = Header(None)) -> 
         logger.warning("[MCP] Auth failed: invalid Authorization header format (expected 'Bearer <token>')")
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
     token = token.strip()
-    if not secrets.compare_digest(token, expected):
-        logger.warning("[MCP] Auth failed: token mismatch (received_len=%d, expected_len=%d, received=%s)", len(token), len(expected), token)
+    matched = any(secrets.compare_digest(token, expected) for expected in expected_keys.values())
+    if not matched:
+        logger.warning("[MCP] Auth failed: token mismatch (received_len=%d)", len(token))
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
     logger.info("[MCP] Auth success")
 
@@ -169,10 +199,22 @@ async def _call_submcp(sub: SubMCPConfig, method: str, params: Optional[dict], r
         "params": params or {},
     }
     url = f"{sub.base_url.rstrip('/')}/mcp"
-    async with httpx.AsyncClient(timeout=_submcp_timeout()) as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+    logger.info("[MCP] Calling SubMCP: sub_name=%s, url=%s, method=%s", sub.name, url, method)
+    try:
+        async with httpx.AsyncClient(timeout=_submcp_timeout()) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            logger.info("[MCP] SubMCP response: sub_name=%s, status=%d", sub.name, resp.status_code)
+            return resp.json()
+    except httpx.RequestError as exc:
+        logger.error("[MCP] SubMCP connection error: sub_name=%s, url=%s, error=%s", sub.name, url, exc)
+        raise
+    except httpx.HTTPStatusError as exc:
+        logger.error("[MCP] SubMCP HTTP error: sub_name=%s, status=%d, error=%s", sub.name, exc.response.status_code, exc)
+        raise
+    except Exception as exc:
+        logger.error("[MCP] SubMCP unexpected error: sub_name=%s, error=%s", sub.name, exc)
+        raise
 
 
 async def _fetch_submcp_tools(sub: SubMCPConfig, request_id: Optional[str]) -> list[dict]:

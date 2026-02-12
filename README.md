@@ -37,7 +37,8 @@ uvicorn src.mcp_server:app --reload --port 3000
 포트는 환경변수 `PORT`로 변경 가능합니다.
 
 Gateway 인증 설정 (Copilot -> Gateway):
-- `MCP_API_KEY`: Gateway 요청에 사용할 API 키
+- 단일 키: `MCP_API_KEY`
+- 다중 키: `MCP_API_KEYS` (label:key 또는 label=key, 쉼표로 구분)
 - 요청 헤더: `Authorization: Bearer <MCP_API_KEY>`
 - 키는 환경변수 또는 `config/submcp.env`에 넣어도 됩니다 (환경변수 우선).
 
