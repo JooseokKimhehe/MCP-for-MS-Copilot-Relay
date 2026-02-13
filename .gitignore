@@ -4,4 +4,4 @@ config/submcp.env
 .venv/
 venv/
 __pycache__/
-
+log/
