@@ -6,6 +6,8 @@ Endpoints:
 - `GET /health` - 상태 확인
 - `POST /mcp` - Copilot 요청 수신 후 SubMCP로 프록시
 - `GET /mcp/tools` - SubMCP 도구 목록 집계
+- `GET /mcp/RenewAuthKey` - `config/submcp.env` 기반 인증키 갱신
+- `GET /mcp/log/{YYYYMMDD}` - 날짜별 로그 조회 (예: `/mcp/log/20260213`)
 
 ---
 
@@ -41,6 +43,15 @@ Gateway 인증 설정 (Copilot -> Gateway):
 - 다중 키: `MCP_API_KEYS` (label:key 또는 label=key, 쉼표로 구분)
 - 요청 헤더: `Authorization: Bearer <MCP_API_KEY>`
 - 키는 환경변수 또는 `config/submcp.env`에 넣어도 됩니다 (환경변수 우선).
+
+인증키 갱신:
+- `GET /mcp/RenewAuthKey` 호출 시 `config/submcp.env` 값을 다시 읽어 반영합니다.
+- `MCP_API_KEY`, `MCP_API_KEYS`만 갱신 대상입니다.
+
+로그 저장 및 조회:
+- 로그는 `/log` 폴더에 `YYYYMMDD.log` 형식으로 날짜별 저장됩니다.
+- 같은 날짜의 로그가 있으면 이어서 기록합니다.
+- 브라우저에서 `http://서버IP:포트/mcp/log/20260213` 형식으로 조회 가능합니다.
 
 SubMCP 연결 설정 (환경변수):
 - `SUB_MCP_REGISTRY` (권장): JSON 배열

@@ -3,15 +3,19 @@ import json
 import logging
 import os
 import secrets
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("mcp_server")
 _SUBMCP_ENV_PATH = os.path.join("config", "submcp.env")
+_LOG_DIR = "log"
+_LOG_DATE_FORMAT = "%Y%m%d"
 
 
 class MCPRequest(BaseModel):
@@ -50,6 +54,57 @@ class SubMCPConfig:
 
 
 app = FastAPI(title="MCP Gateway (Python)")
+
+
+class _DateRollingFileHandler(logging.Handler):
+    def __init__(self, log_dir: str, date_format: str, formatter: logging.Formatter) -> None:
+        super().__init__()
+        self._log_dir = log_dir
+        self._date_format = date_format
+        self._formatter = formatter
+        self._current_date: str | None = None
+        self._handler: logging.FileHandler | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            current_date = datetime.now().strftime(self._date_format)
+            if self._handler is None or self._current_date != current_date:
+                self._rotate_handler(current_date)
+            if self._handler is None:
+                return
+            self._handler.emit(record)
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        if self._handler:
+            self._handler.close()
+            self._handler = None
+        super().close()
+
+    def _rotate_handler(self, current_date: str) -> None:
+        os.makedirs(self._log_dir, exist_ok=True)
+        filename = os.path.join(self._log_dir, f"{current_date}.log")
+        if self._handler:
+            self._handler.close()
+        self._handler = logging.FileHandler(filename, mode="a", encoding="utf-8")
+        self._handler.setFormatter(self._formatter)
+        self._current_date = current_date
+
+
+def configure_gateway_logging() -> None:
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
+
+    if not any(isinstance(handler, _DateRollingFileHandler) for handler in root_logger.handlers):
+        file_handler = _DateRollingFileHandler(_LOG_DIR, _LOG_DATE_FORMAT, formatter)
+        root_logger.addHandler(file_handler)
 
 
 def _parse_submcp_registry(raw: str) -> list[SubMCPConfig]:
@@ -97,6 +152,29 @@ def _load_env_file(path: str) -> None:
                 os.environ[key] = value
     except OSError as exc:
         logger.warning("[MCP] Failed to read %s: %s", path, exc)
+
+
+def _read_env_file_values(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not os.path.isfile(path):
+        return values
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"')
+                if not key:
+                    continue
+                values[key] = value
+    except OSError as exc:
+        logger.warning("[MCP] Failed to read %s: %s", path, exc)
+    return values
 
 
 def _load_submcp_configs() -> list[SubMCPConfig]:
@@ -149,6 +227,17 @@ def _get_gateway_api_keys() -> dict[str, str]:
     return {}
 
 
+def _reload_gateway_auth_from_env_file() -> dict[str, str]:
+    env_values = _read_env_file_values(_SUBMCP_ENV_PATH)
+    managed_keys = {"MCP_API_KEYS", "MCP_API_KEY"}
+    for key in managed_keys:
+        if key in env_values:
+            os.environ[key] = env_values[key]
+        else:
+            os.environ.pop(key, None)
+    return _get_gateway_api_keys()
+
+
 async def _require_gateway_auth(authorization: Optional[str] = Header(None)) -> None:
     expected_keys = _get_gateway_api_keys()
     logger.info("[MCP] Auth check: expected_key_count=%d", len(expected_keys))
@@ -189,6 +278,16 @@ def _submcp_timeout() -> float:
         return float(os.getenv("SUB_MCP_TIMEOUT", "10"))
     except ValueError:
         return 10.0
+
+
+def _is_valid_log_date(value: str) -> bool:
+    if len(value) != 8 or not value.isdigit():
+        return False
+    try:
+        datetime.strptime(value, _LOG_DATE_FORMAT)
+    except ValueError:
+        return False
+    return True
 
 
 async def _call_submcp(sub: SubMCPConfig, method: str, params: Optional[dict], request_id: Optional[str]) -> dict:
@@ -270,6 +369,7 @@ async def _fetch_submcp_tool_models(sub: SubMCPConfig) -> list[dict]:
 
 @app.on_event("startup")
 async def on_startup():
+    configure_gateway_logging()
     # 서버 시작 시 로그 출력
     logger.info("[MCP] Server starting up")
 
@@ -279,6 +379,29 @@ async def health():
     # 상태 확인 요청 처리
     logger.info("[MCP] Health check requested")
     return {"status": "ok"}
+
+
+@app.get("/mcp/RenewAuthKey")
+async def renew_auth_key():
+    keys = _reload_gateway_auth_from_env_file()
+    logger.info("[MCP] Auth keys reloaded: key_count=%d", len(keys))
+    return {"status": "ok", "keyCount": len(keys)}
+
+
+@app.get("/mcp/log/{log_date}")
+async def get_log(log_date: str):
+    if not _is_valid_log_date(log_date):
+        raise HTTPException(status_code=400, detail={"error": "invalid_log_date"})
+    log_path = os.path.join(_LOG_DIR, f"{log_date}.log")
+    if not os.path.isfile(log_path):
+        raise HTTPException(status_code=404, detail={"error": "log_not_found"})
+    try:
+        with open(log_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError as exc:
+        logger.warning("[MCP] Failed to read log file: %s", exc)
+        raise HTTPException(status_code=500, detail={"error": "log_read_failed"})
+    return PlainTextResponse(content)
 
 
 @app.post("/mcp")
